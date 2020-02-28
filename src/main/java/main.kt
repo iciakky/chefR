@@ -1,138 +1,179 @@
 import com.google.gson.Gson
 import java.net.URL
 import java.util.*
-import kotlin.Comparator
-import kotlin.collections.HashMap
-import kotlin.math.log2
+import kotlin.math.abs
 
 val raw =
     URL("https://gist.githubusercontent.com/iciakky/cd98792f54e52b65b9cb2e30c1de9cbd/raw/e4e68a86391cd521a747c29bd8b48e7cd4f4ac88/chefIndi.json").readText()
 
 fun main() {
-    // requirement config
-    val mustHave = setOf("Egg", "Beet")
-    // todo allow specify conditions to inference potential calculation
 
+    // # 準備階段
+    // 讀取設定參數 // todo replace hardcoded config
+    val forbidTags = setOf("Meat", "Seafood")
+    val mustHave = mapOf(setOf("Egg") to 20, setOf("Vegetables") to 100)
+    val perks = mapOf("" to 10, "Fruit" to -3, "Nut" to 80) // n means # ingredients is n, -m means portion is m
     // 讀取並解析食材資料
     val data: Raw = Gson().fromJson(raw, Raw::class.java)
-
     // 根據指定條件篩選掉絕對不會使用的食材
-    val fixedIngredients = data.indi.filter { mustHave.contains(it.Name) }
-
-    // error handling: missing ingredient
-    val missing = mustHave.filterNot { fixed -> fixedIngredients.any { it.Name == fixed } }
-    if (missing.any()) {
-        println("some of specified ingredient is missing: ${missing.joinToString(",")}")
-        return
+    val candidates = data.indi.filterNot {
+        it.AromaNeutral || it.Tags.any { t -> forbidTags.contains(t) } || !data.match.contains(it.Name)
     }
-    val maxCookingTime = fixedIngredients.maxBy { it.CookingTime }?.CookingTime ?: Int.MAX_VALUE
-    val candidates =
-        data.indi.filterNot { it.CookingTime > maxCookingTime || it.AromaNeutral || !data.match.contains(it.Name) }
-
     // 為了用 bits 表示食譜，將食材對應至 bit
-    val requiredBits = kotlin.math.ceil(log2(candidates.count().toDouble())).toInt()
+    val requiredBits = candidates.count()
     val ingredBitsMap =
         candidates.mapIndexed { i, ingredient -> ingredient.Name to BitSet(requiredBits).apply { set(i) } }.toMap()
 
-    // 能用 bits 表示食材和食譜後，就能指定從一個食譜出發
+    val known = HashSet<BitSet>()
+    // todo runtime change priority, migrate to newly configured priority queue, continue search
+    val priority = compareByDescending<Recipe> { it.mustHaveCompleteRate }
+        .thenBy { it.cookingTime }
+        .thenByDescending { it.perkCompleteRate }
+        .thenByDescending { it.flavor.coerceAtMost(50) }
+        .thenBy { it.realCost }
+    val suggestion = PriorityQueue<Recipe>(priority)
+    Recipe.candidates = candidates
+    Recipe.ingredBitsMap = ingredBitsMap
+    Recipe.match = data.match
+    Recipe.mustHave = mustHave
+    Recipe.perks = perks
 
-    val open = HashSet<BitSet>()
-    val closed = HashMap<BitSet, Recipe>()
-    val suggestion = PriorityQueue<Recipe>(Comparator.comparing<Recipe, Float> { it.potential }.reversed())
-
-    // 從指定的 Recipe 作為起點開始搜尋最佳解
-    val beginRecipe = Recipe(
-        fixedIngredients,
-        2, // todo calculate flavor from fixedIngredients
-        fixedIngredients.sumByDouble { it.MinCost.toDouble() }.toFloat(),
-        candidates, ingredBitsMap, data.match
-    )
-
-    // 以風味滿50分且成本最低為目標
-    val over50 = PriorityQueue<Recipe>(Comparator.comparing<Recipe, Float> { it.cost })
-
-    open += beginRecipe.bits
+    // # 初始化搜尋起始狀態
+    val beginRecipe = Recipe(emptyList(), 0, 0F)
     suggestion += beginRecipe
+    known += beginRecipe.bits
 
+    // 目標：風味滿50分的前提下，煮最快且成本最低
+    val solutions = PriorityQueue<Recipe>(priority)
+
+    // 開始搜尋
     println("start!")
-    while (open.any()) {
+    while (suggestion.any()) {
         val curr = suggestion.poll()!!
-        open.remove(curr.bits)
-        closed[curr.bits] = curr
+        solutions += curr
 
-        // 搜尋相鄰的 Recipes 意味著：新增一種食材進 Recipes
-        for ((index, candidate) in candidates.withIndex()) {
+        // 刷新目前最佳
+        if (solutions.peek() == curr) {
+            println(
+                "${solutions.count()} done, ${suggestion.count()} todo, best: " +
+                        "${curr.mustHaveCompleteRate}/${curr.perkCompleteRate}/${curr.realCost}/${curr.ingredients.joinToString { it.Name }}"
+            )
+        }
+
+        // 搜尋相鄰的 Recipes 意味著：新增或移除一種食材進 Recipes
+        for ((index, _) in candidates.withIndex()) {
             val adjacentBits = BitSet.valueOf(curr.bits.toLongArray()).apply { flip(index) }
-            if (closed.contains(adjacentBits) || open.contains(adjacentBits) || mustHave.contains(candidate.Name)) {
+            // 不重複搜尋
+            if (known.contains(adjacentBits)) {
                 continue
             }
+            known += adjacentBits
 
             val recipe = curr.evolveNew(index)
-            open += adjacentBits
             suggestion += recipe
+        }
+    }
+    println("end!") // probably never run to here
+}
 
-            if (recipe.flavor >= 50) {
-                over50 += recipe
-                if (over50.peek() == recipe) {
-                    val bestNow = over50.peek()
-                    println("best recipe now : " + bestNow.ingredients.joinToString(",") { it.Name })
-                    println("(flavor/cost)   : ${bestNow.flavor}/${bestNow.cost}")
+// todo consider mustHave and perk for cost and flavor
+data class Recipe(
+    val ingredients: List<Ingredient> = emptyList(),
+    val flavor: Int,
+    val cost: Float
+) {
+    companion object {
+        lateinit var candidates: List<Ingredient>
+        lateinit var ingredBitsMap: Map<String, BitSet>
+        lateinit var match: Map<String, Match>
+        lateinit var mustHave: Map<Set<String>, Int>
+        lateinit var perks: Map<String, Int>
+    }
+
+    // todo calc a new cost based on mustHave and perks
+
+    // 0 ~ 720
+    val cookingTime by lazy { ingredients.maxBy { it.CookingTime }?.CookingTime ?: 0 }
+
+    // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
+    val mustHaveCompleteRate: Int by lazy {
+        if (mustHave.isEmpty()) 0
+        else mustHave.count { (condition, _) ->
+            ingredients.any {
+                condition.contains(it.Name) || it.Tags.any { tag -> condition.contains(tag) }
+            }
+        }
+    }
+    // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
+    val perkCompleteRate: Int by lazy {
+        if (perks.isEmpty()) 0
+        else perks.count { (condition, quantity) ->
+            // 總食材個數
+            if (condition.isBlank()) {
+                if (quantity < 0) {
+                    // 以下
+                    ingredients.count() <= abs(quantity)
+                } else {
+                    // 以上
+                    ingredients.count() >= abs(quantity)
+                }
+            } else {
+                // 特定食材個數或量
+                if (quantity < 0) {
+                    // 個數
+                    ingredients.count {
+                        it.Name == condition || it.Tags.contains(condition)
+                    } >= abs(quantity)
+                } else {
+                    // 量
+                    ingredients.any {
+                        it.MaxPortion >= abs(quantity) && (it.Name == condition || it.Tags.contains(condition))
+                    }
                 }
             }
         }
     }
-}
-
-fun List<Ingredient>.toBits(mapping: Map<String, BitSet>): BitSet {
-    return this.fold(BitSet()) { ret, ing ->
-        ret.apply {
-            or(mapping[ing.Name] ?: error("missing bits mapping of ingredient ${ing.Name}"))
+    // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
+    val realCost: Float by lazy {
+        // 這裡假設在要求分量時上 mustHave 跟 perks 不會重複
+        // 對每個分量要求，找到 Unit Cost 最低的選項，將原本的 cost 加上額外增加的成本 (unit*portion - minCost)
+        mustHave.entries.fold(0F) { ret, (conditions, portion) ->
+            ret + (ingredients.filter { conditions.contains(it.Name) || it.Tags.any { tag -> conditions.contains(tag) } }
+                .minBy { it.UnitCost }?.let { it.UnitCost * portion - it.MinCost } ?: 0F)
+        } + perks.filter { it.key.isNotBlank() && it.value >= 0 }.entries.fold(0F) { ret, (condition, portion) ->
+            ret + (ingredients.filter { it.Name == condition || it.Tags.contains(condition) }
+                .minBy { it.UnitCost }?.let { it.UnitCost * portion - it.MinCost } ?: 0F)
+        } + cost
+    }
+    val bits: BitSet by lazy {
+        ingredients.fold(BitSet()) { ret, ing ->
+            ret.apply {
+                or(ingredBitsMap[ing.Name] ?: error("missing bits mapping of ingredient ${ing.Name}"))
+            }
         }
     }
-}
 
-data class Recipe(
-    val ingredients: List<Ingredient> = emptyList(),
-    val flavor: Int,
-    val cost: Float,
-    val candidates: List<Ingredient>,
-    val ingredBitsMap: Map<String, BitSet>,
-    val match: Map<String, Match>
-) {
-    val bits: BitSet by lazy {
-        ingredients.toBits(ingredBitsMap)
-    }
-
-    val potential: Float by lazy {
-        // heuristic
-        flavor.coerceAtMost(50) * 10000 + flavor / cost
-    }
+    fun contains(ingredientIndex: Int) = this.bits.get(ingredientIndex)
 
     fun evolveNew(changedBitIndex: Int): Recipe {
         val changedIngredient = candidates[changedBitIndex]
-        if (this.bits.get(changedBitIndex)) {
+        if (this.contains(changedBitIndex)) {
             return Recipe(
                 ingredients = this.ingredients - changedIngredient,
                 flavor = this.ingredients.fold(this.flavor) { newFlavor, ingredient ->
                     if (ingredient == changedIngredient)
                         newFlavor
-                    else newFlavor - (this.match[ingredient.Name]!!.byName[changedIngredient.Name] ?: -1) * 2
+                    else newFlavor - (match[ingredient.Name]!!.byName[changedIngredient.Name] ?: -1) * 2
                 },
-                cost = this.cost - changedIngredient.MinCost,
-                candidates = this.candidates,
-                ingredBitsMap = this.ingredBitsMap,
-                match = this.match
+                cost = this.cost - changedIngredient.MinCost
             )
         } else {
             return Recipe(
                 ingredients = this.ingredients + changedIngredient,
                 flavor = this.ingredients.fold(this.flavor) { newFlavor, ingredient ->
-                    newFlavor + (this.match[ingredient.Name]!!.byName[changedIngredient.Name] ?: -1) * 2
+                    newFlavor + (match[ingredient.Name]!!.byName[changedIngredient.Name] ?: -1) * 2
                 },
-                cost = this.cost + changedIngredient.MinCost,
-                candidates = this.candidates,
-                ingredBitsMap = this.ingredBitsMap,
-                match = this.match
+                cost = this.cost + changedIngredient.MinCost
             )
         }
     }
