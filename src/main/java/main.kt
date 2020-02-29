@@ -3,6 +3,8 @@ import java.net.URL
 import java.util.*
 import kotlin.math.abs
 
+val divider = "-".repeat(40)
+
 val raw =
     URL("https://gist.githubusercontent.com/iciakky/cd98792f54e52b65b9cb2e30c1de9cbd/raw/e4e68a86391cd521a747c29bd8b48e7cd4f4ac88/chefIndi.json").readText()
 
@@ -35,9 +37,10 @@ fun main() {
     val mustNotHave: Set<String> = setOf(Tag.Vegetables.name, Tag.Seafood.name, Tag.Meat.name, Tag.Dairy.name)
     val boughtIngredients = listOf("Beet", "Ginger", "Pickles")
     val canBuyIngredientCount = 3
-    val cookingTimeModifier = 0
+    val cookingTimeModifier = 0F
     val perks: Map<String, Pair<Int, Int>> =
         emptyMap() // mapOf("" to (10 to 0), "Fruit" to (3 to 0), "Nut" to (1 to 80))
+    val leaderboardSize = 10
     // 讀取並解析食材資料
     val data: Raw = Gson().fromJson(raw, Raw::class.java)
     val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
@@ -65,7 +68,7 @@ fun main() {
         .thenByDescending { it.perkCompleteRate }
         .thenByDescending { it.flavor.coerceAtMost(50) }
         .thenBy { it.realCost }
-    val suggestion = PriorityQueue<Recipe>(priority)
+    val open = PriorityQueue<Recipe>(priority)
     Recipe.candidates = candidates
     Recipe.available = available
     Recipe.ingredBitsMap = ingredBitsMap
@@ -76,25 +79,24 @@ fun main() {
 
     // # 初始化搜尋起始狀態
     val beginRecipe = Recipe(emptyList(), 0, 0F)
-    suggestion += beginRecipe
+    open += beginRecipe
     known += beginRecipe.bits
 
     // todo save/load solutions
     // 目標：風味滿50分的前提下，煮最快且成本最低
-    val solutions = PriorityQueue<Recipe>(priority)
+    val closed = PriorityQueue<Recipe>(priority)
+
+    // 排行榜－顯示目前前 n 個最佳解
+    val leaderboard = PriorityQueue<Recipe>(priority.reversed())
 
     // 開始搜尋
     println("start!")
-    while (suggestion.any()) {
-        val curr = suggestion.poll()!!
-        solutions += curr
+    while (open.any()) {
+        val curr = open.poll()!!
+        closed += curr
 
-        // 刷新目前最佳
-        if (solutions.peek() == curr) {
-            println(
-                "${solutions.count()} done, ${suggestion.count()} todo, best: " +
-                        "${curr.toBuyIngredientCount}/${curr.mustHaveCompleteRate}/${curr.perkCompleteRate}/${curr.cookingTime}/${curr.realCost}/${curr.flavor}/${curr.ingredients.joinToString { it.Name }}"
-            )
+        if (closed.count() % 100 == 0) {
+            print("\r[${closed.count()} closed, ${open.count()} open]".format())
         }
 
         // 搜尋相鄰的 Recipes 意味著：新增或移除一種食材進 Recipes
@@ -107,7 +109,16 @@ fun main() {
             known += adjacentBits
 
             val recipe = curr.evolveNew(index)
-            suggestion += recipe
+            open += recipe
+
+            // 刷新排行榜
+            leaderboard += recipe
+            if (leaderboard.count() <= leaderboardSize || leaderboard.poll() != recipe) {
+                println("\n$divider [best $leaderboardSize below] $divider")
+                leaderboard.asSequence().sortedWith(priority).forEachIndexed { rank, leadingRecipe ->
+                    println("#$rank: ${leadingRecipe.toShortString()}")
+                }
+            }
         }
     }
     println("end!") // probably never run to here
@@ -226,6 +237,10 @@ data class Recipe(
                 cost = this.cost + changedIngredient.MinCost
             )
         }
+    }
+
+    fun toShortString(): String {
+        return "${toBuyIngredientCount}/${mustHaveCompleteRate}/${perkCompleteRate}/${cookingTime}/${realCost}/${flavor}/${ingredients.joinToString { it.Name }}"
     }
 }
 
