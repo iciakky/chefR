@@ -45,19 +45,11 @@ fun main() {
     val data: Raw = Gson().fromJson(raw, Raw::class.java)
     val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
     available += boughtIngredients
-    // 根據指定條件篩選掉絕對不會使用的食材 (沒有任何 match 的食材)，但 mustHave 必須留下
-    val candidates = data.indi
-        // todo fix: rm following filter condition will break my program...
-        // but if all ingredient is involve in search then all solutions can be unified
-        .filterNot { ingredient ->
-            !mustHave.any { (condition, _) ->
-                condition.contains(ingredient.Name) || ingredient.Tags.any { tag -> condition.contains(tag) }
-            } && (ingredient.AromaNeutral || !data.match.contains(ingredient.Name))
-        }
+
     // 為了用 bits 表示食譜，將食材對應至 bit
-    val requiredBits = candidates.count()
+    val requiredBits = data.indi.count()
     val ingredBitsMap =
-        candidates.mapIndexed { i, ingredient -> ingredient.Name to BitSet(requiredBits).apply { set(i) } }.toMap()
+        data.indi.mapIndexed { i, ingredient -> ingredient.Name to BitSet(requiredBits).apply { set(i) } }.toMap()
 
     val known = HashSet<BitSet>()
     // todo runtime change priority, migrate to newly configured priority queue, continue search
@@ -69,7 +61,7 @@ fun main() {
         .thenByDescending { it.flavor.coerceAtMost(50) }
         .thenBy { it.realCost }
     val open = PriorityQueue<Recipe>(priority)
-    Recipe.candidates = candidates
+    Recipe.candidates = data.indi
     Recipe.available = available
     Recipe.ingredBitsMap = ingredBitsMap
     Recipe.match = data.match
@@ -100,7 +92,7 @@ fun main() {
         }
 
         // 搜尋相鄰的 Recipes 意味著：新增或移除一種食材進 Recipes
-        for ((index, _) in candidates.withIndex()) {
+        for ((index, _) in data.indi.withIndex()) {
             val adjacentBits = BitSet.valueOf(curr.bits.toLongArray()).apply { flip(index) }
             // 不重複搜尋
             if (known.contains(adjacentBits)) {
@@ -219,6 +211,7 @@ data class Recipe(
                 flavor = this.ingredients.fold(this.flavor) { newFlavor, ingredient ->
                     when {
                         ingredient == changedIngredient -> newFlavor
+                        ingredient.AromaNeutral -> newFlavor
                         changedIngredient.AromaNeutral -> newFlavor
                         else -> newFlavor - (match[ingredient.Name]?.byName?.get(changedIngredient.Name) ?: -1) * 2
                     }
@@ -230,6 +223,7 @@ data class Recipe(
                 ingredients = this.ingredients + changedIngredient,
                 flavor = this.ingredients.fold(this.flavor) { newFlavor, ingredient ->
                     when {
+                        ingredient.AromaNeutral -> newFlavor
                         changedIngredient.AromaNeutral -> newFlavor
                         else -> newFlavor + (match[ingredient.Name]?.byName?.get(changedIngredient.Name) ?: -1) * 2
                     }
