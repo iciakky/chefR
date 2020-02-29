@@ -6,18 +6,30 @@ import kotlin.math.abs
 val raw =
     URL("https://gist.githubusercontent.com/iciakky/cd98792f54e52b65b9cb2e30c1de9cbd/raw/e4e68a86391cd521a747c29bd8b48e7cd4f4ac88/chefIndi.json").readText()
 
+val rawAvailable =
+    URL("https://gist.githubusercontent.com/iciakky/f0192781a907247bb5d667f8ec597428/raw/cacc19c7fe2f8ec592c49c6bbfa0fbdaeae962ce/defaultIngredients.json").readText()
+
+// todo support CLI
 fun main() {
 
     // # 準備階段
     // 讀取設定參數 // todo replace hardcoded config
-    val forbidTags = setOf("Meat", "Seafood")
-    val mustHave = mapOf(setOf("Egg") to 20, setOf("Vegetables") to 100)
-    val perks = mapOf("" to 10, "Fruit" to -3, "Nut" to 80) // n means # ingredients is n, -m means portion is m
+    val mustHave: Map<Set<String>, Pair<Int, Int>> = mapOf(setOf("Vegetables") to (2 to 50))
+    val mustNotHave: Set<String> = emptySet() // setOf("Meat", "Seafood", "Dairy")
+    val perks: Map<String, Pair<Int, Int>> =
+        emptyMap() // mapOf("" to (10 to 0), "Fruit" to (3 to 0), "Nut" to (1 to 80))
     // 讀取並解析食材資料
     val data: Raw = Gson().fromJson(raw, Raw::class.java)
-    // 根據指定條件篩選掉絕對不會使用的食材
-    val candidates = data.indi.filterNot {
-        it.AromaNeutral || it.Tags.any { t -> forbidTags.contains(t) } || !data.match.contains(it.Name)
+    val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
+    // available += "Lime" // todo 可從 config 或 runtime 新增可用食材
+    // 根據指定條件篩選掉絕對不會使用的食材 (沒有任何 match 的食材)，但 mustHave 必須留下
+    val candidates = data.indi
+        // todo fix: rm following filter condition will break my program...
+        // but if all ingredient is involve in search then all solutions can be unified
+        .filterNot { ingredient ->
+        !mustHave.any { (condition, _) ->
+            condition.contains(ingredient.Name) || ingredient.Tags.any { tag -> condition.contains(tag) }
+        } && (ingredient.AromaNeutral || !data.match.contains(ingredient.Name))
     }
     // 為了用 bits 表示食譜，將食材對應至 bit
     val requiredBits = candidates.count()
@@ -26,16 +38,20 @@ fun main() {
 
     val known = HashSet<BitSet>()
     // todo runtime change priority, migrate to newly configured priority queue, continue search
-    val priority = compareByDescending<Recipe> { it.mustHaveCompleteRate }
+    val priority = compareByDescending<Recipe> { it.allAvailable }
+        .thenByDescending { it.mustHaveCompleteRate }
+        .thenByDescending { it.mustNotHaveCompleteRate }
         .thenBy { it.cookingTime }
         .thenByDescending { it.perkCompleteRate }
         .thenByDescending { it.flavor.coerceAtMost(50) }
         .thenBy { it.realCost }
     val suggestion = PriorityQueue<Recipe>(priority)
     Recipe.candidates = candidates
+    Recipe.available = available
     Recipe.ingredBitsMap = ingredBitsMap
     Recipe.match = data.match
     Recipe.mustHave = mustHave
+    Recipe.mustNotHave = mustNotHave
     Recipe.perks = perks
 
     // # 初始化搜尋起始狀態
@@ -43,6 +59,7 @@ fun main() {
     suggestion += beginRecipe
     known += beginRecipe.bits
 
+    // todo save/load solutions
     // 目標：風味滿50分的前提下，煮最快且成本最低
     val solutions = PriorityQueue<Recipe>(priority)
 
@@ -56,7 +73,7 @@ fun main() {
         if (solutions.peek() == curr) {
             println(
                 "${solutions.count()} done, ${suggestion.count()} todo, best: " +
-                        "${curr.mustHaveCompleteRate}/${curr.perkCompleteRate}/${curr.realCost}/${curr.ingredients.joinToString { it.Name }}"
+                        "${curr.allAvailable}/${curr.mustHaveCompleteRate}/${curr.perkCompleteRate}/${curr.cookingTime}/${curr.realCost}/${curr.flavor}/${curr.ingredients.joinToString { it.Name }}"
             )
         }
 
@@ -84,13 +101,15 @@ data class Recipe(
 ) {
     companion object {
         lateinit var candidates: List<Ingredient>
+        lateinit var available: Set<String>
         lateinit var ingredBitsMap: Map<String, BitSet>
         lateinit var match: Map<String, Match>
-        lateinit var mustHave: Map<Set<String>, Int>
-        lateinit var perks: Map<String, Int>
+        lateinit var mustHave: Map<Set<String>, Pair<Int, Int>>
+        lateinit var mustNotHave: Set<String>
+        lateinit var perks: Map<String, Pair<Int, Int>>
     }
 
-    // todo calc a new cost based on mustHave and perks
+    val allAvailable by lazy { ingredients.all { available.contains(it.Name) } }
 
     // 0 ~ 720
     val cookingTime by lazy { ingredients.maxBy { it.CookingTime }?.CookingTime ?: 0 }
@@ -98,38 +117,40 @@ data class Recipe(
     // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
     val mustHaveCompleteRate: Int by lazy {
         if (mustHave.isEmpty()) 0
-        else mustHave.count { (condition, _) ->
+        else mustHave.map { (condition, numberAndPortion) ->
+            val (number, portion) = numberAndPortion
+            ingredients.filter {
+                it.MaxPortion >= portion && (condition.contains(it.Name) || it.Tags.any { tag -> condition.contains(tag) })
+            }.take(number).count()
+        }.sum()
+    }
+    val mustNotHaveCompleteRate: Int by lazy {
+        if (mustNotHave.isEmpty()) 0
+        else mustNotHave.count { condition ->
             ingredients.any {
                 condition.contains(it.Name) || it.Tags.any { tag -> condition.contains(tag) }
             }
-        }
+        } * -1
     }
     // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
     val perkCompleteRate: Int by lazy {
         if (perks.isEmpty()) 0
-        else perks.count { (condition, quantity) ->
+        else perks.count { (condition, numberAndPortion) ->
+            val (number, portion) = numberAndPortion
             // 總食材個數
             if (condition.isBlank()) {
-                if (quantity < 0) {
+                if (number < 0) {
                     // 以下
-                    ingredients.count() <= abs(quantity)
+                    ingredients.count() <= abs(number)
                 } else {
                     // 以上
-                    ingredients.count() >= abs(quantity)
+                    ingredients.count() >= abs(number)
                 }
             } else {
                 // 特定食材個數或量
-                if (quantity < 0) {
-                    // 個數
-                    ingredients.count {
-                        it.Name == condition || it.Tags.contains(condition)
-                    } >= abs(quantity)
-                } else {
-                    // 量
-                    ingredients.any {
-                        it.MaxPortion >= abs(quantity) && (it.Name == condition || it.Tags.contains(condition))
-                    }
-                }
+                ingredients.count {
+                    it.MaxPortion >= portion && (it.Name == condition || it.Tags.contains(condition))
+                } >= number
             }
         }
     }
@@ -137,12 +158,16 @@ data class Recipe(
     val realCost: Float by lazy {
         // 這裡假設在要求分量時上 mustHave 跟 perks 不會重複
         // 對每個分量要求，找到 Unit Cost 最低的選項，將原本的 cost 加上額外增加的成本 (unit*portion - minCost)
-        mustHave.entries.fold(0F) { ret, (conditions, portion) ->
-            ret + (ingredients.filter { conditions.contains(it.Name) || it.Tags.any { tag -> conditions.contains(tag) } }
-                .minBy { it.UnitCost }?.let { it.UnitCost * portion - it.MinCost } ?: 0F)
-        } + perks.filter { it.key.isNotBlank() && it.value >= 0 }.entries.fold(0F) { ret, (condition, portion) ->
-            ret + (ingredients.filter { it.Name == condition || it.Tags.contains(condition) }
-                .minBy { it.UnitCost }?.let { it.UnitCost * portion - it.MinCost } ?: 0F)
+        mustHave.entries.fold(0F) { ret, (conditions, numberAndPortion) ->
+            val (number, portion) = numberAndPortion
+            if (portion < 0) ret
+            else ret + (ingredients.asSequence().filter {
+                conditions.contains(it.Name) || it.Tags.any { tag -> conditions.contains(tag) }
+            }.sortedBy { it.UnitCost }.take(number).map { it.UnitCost * portion - it.MinCost }.sum())
+        } + perks.filter { it.key.isNotBlank() && it.value.second > 0 }.entries.fold(0F) { ret, (condition, numberAndPortion) ->
+            val (number, portion) = numberAndPortion
+            ret + (ingredients.asSequence().filter { it.Name == condition || it.Tags.contains(condition) }
+                .sortedBy { it.UnitCost }.take(number).map { it.UnitCost * portion - it.MinCost }.sum())
         } + cost
     }
     val bits: BitSet by lazy {
@@ -161,9 +186,11 @@ data class Recipe(
             return Recipe(
                 ingredients = this.ingredients - changedIngredient,
                 flavor = this.ingredients.fold(this.flavor) { newFlavor, ingredient ->
-                    if (ingredient == changedIngredient)
-                        newFlavor
-                    else newFlavor - (match[ingredient.Name]!!.byName[changedIngredient.Name] ?: -1) * 2
+                    when {
+                        ingredient == changedIngredient -> newFlavor
+                        changedIngredient.AromaNeutral -> newFlavor
+                        else -> newFlavor - (match[ingredient.Name]?.byName?.get(changedIngredient.Name) ?: -1) * 2
+                    }
                 },
                 cost = this.cost - changedIngredient.MinCost
             )
@@ -171,7 +198,10 @@ data class Recipe(
             return Recipe(
                 ingredients = this.ingredients + changedIngredient,
                 flavor = this.ingredients.fold(this.flavor) { newFlavor, ingredient ->
-                    newFlavor + (match[ingredient.Name]!!.byName[changedIngredient.Name] ?: -1) * 2
+                    when {
+                        changedIngredient.AromaNeutral -> newFlavor
+                        else -> newFlavor + (match[ingredient.Name]?.byName?.get(changedIngredient.Name) ?: -1) * 2
+                    }
                 },
                 cost = this.cost + changedIngredient.MinCost
             )
