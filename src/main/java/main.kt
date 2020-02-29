@@ -9,28 +9,48 @@ val raw =
 val rawAvailable =
     URL("https://gist.githubusercontent.com/iciakky/f0192781a907247bb5d667f8ec597428/raw/cacc19c7fe2f8ec592c49c6bbfa0fbdaeae962ce/defaultIngredients.json").readText()
 
+enum class Tag {
+    Vegetables,
+    Spice,
+    Nut,
+    Seafood,
+    Fruit,
+    Meat,
+    Legume,
+    Dairy,
+    Other,
+    Carbs,
+    Alcohol,
+    Beer,
+    Fat,
+    Wine
+}
+
 // todo support CLI
 fun main() {
 
     // # 準備階段
     // 讀取設定參數 // todo replace hardcoded config
-    val mustHave: Map<Set<String>, Pair<Int, Int>> = mapOf(setOf("Vegetables") to (2 to 50))
-    val mustNotHave: Set<String> = emptySet() // setOf("Meat", "Seafood", "Dairy")
+    val mustHave: Map<Set<String>, Pair<Int, Int>> = mapOf(setOf(Tag.Fat.name) to (1 to 20))
+    val mustNotHave: Set<String> = setOf(Tag.Vegetables.name, Tag.Seafood.name, Tag.Meat.name, Tag.Dairy.name)
+    val boughtIngredients = listOf("Beet", "Ginger", "Pickles")
+    val canBuyIngredientCount = 3
+    val cookingTimeModifier = 0
     val perks: Map<String, Pair<Int, Int>> =
         emptyMap() // mapOf("" to (10 to 0), "Fruit" to (3 to 0), "Nut" to (1 to 80))
     // 讀取並解析食材資料
     val data: Raw = Gson().fromJson(raw, Raw::class.java)
     val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
-    // available += "Lime" // todo 可從 config 或 runtime 新增可用食材
+    available += boughtIngredients
     // 根據指定條件篩選掉絕對不會使用的食材 (沒有任何 match 的食材)，但 mustHave 必須留下
     val candidates = data.indi
         // todo fix: rm following filter condition will break my program...
         // but if all ingredient is involve in search then all solutions can be unified
         .filterNot { ingredient ->
-        !mustHave.any { (condition, _) ->
-            condition.contains(ingredient.Name) || ingredient.Tags.any { tag -> condition.contains(tag) }
-        } && (ingredient.AromaNeutral || !data.match.contains(ingredient.Name))
-    }
+            !mustHave.any { (condition, _) ->
+                condition.contains(ingredient.Name) || ingredient.Tags.any { tag -> condition.contains(tag) }
+            } && (ingredient.AromaNeutral || !data.match.contains(ingredient.Name))
+        }
     // 為了用 bits 表示食譜，將食材對應至 bit
     val requiredBits = candidates.count()
     val ingredBitsMap =
@@ -38,10 +58,10 @@ fun main() {
 
     val known = HashSet<BitSet>()
     // todo runtime change priority, migrate to newly configured priority queue, continue search
-    val priority = compareByDescending<Recipe> { it.allAvailable }
+    val priority = compareBy<Recipe> { it.toBuyIngredientCount.coerceAtLeast(canBuyIngredientCount) }
         .thenByDescending { it.mustHaveCompleteRate }
         .thenByDescending { it.mustNotHaveCompleteRate }
-        .thenBy { it.cookingTime }
+        .thenBy { it.cookingTime * cookingTimeModifier }
         .thenByDescending { it.perkCompleteRate }
         .thenByDescending { it.flavor.coerceAtMost(50) }
         .thenBy { it.realCost }
@@ -73,7 +93,7 @@ fun main() {
         if (solutions.peek() == curr) {
             println(
                 "${solutions.count()} done, ${suggestion.count()} todo, best: " +
-                        "${curr.allAvailable}/${curr.mustHaveCompleteRate}/${curr.perkCompleteRate}/${curr.cookingTime}/${curr.realCost}/${curr.flavor}/${curr.ingredients.joinToString { it.Name }}"
+                        "${curr.toBuyIngredientCount}/${curr.mustHaveCompleteRate}/${curr.perkCompleteRate}/${curr.cookingTime}/${curr.realCost}/${curr.flavor}/${curr.ingredients.joinToString { it.Name }}"
             )
         }
 
@@ -109,7 +129,7 @@ data class Recipe(
         lateinit var perks: Map<String, Pair<Int, Int>>
     }
 
-    val allAvailable by lazy { ingredients.all { available.contains(it.Name) } }
+    val toBuyIngredientCount by lazy { ingredients.count { !available.contains(it.Name) } }
 
     // 0 ~ 720
     val cookingTime by lazy { ingredients.maxBy { it.CookingTime }?.CookingTime ?: 0 }
