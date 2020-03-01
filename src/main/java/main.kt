@@ -1,3 +1,9 @@
+import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.output.TermUi
+import com.github.ajalt.clikt.parameters.options.*
+import com.github.ajalt.clikt.parameters.types.float
+import com.github.ajalt.clikt.parameters.types.int
+import com.github.ajalt.clikt.parameters.types.restrictTo
 import com.google.gson.Gson
 import java.net.URL
 import java.util.*
@@ -29,129 +35,228 @@ enum class Tag {
     Wine
 }
 
-// todo support CLI
-fun main() {
+fun main(args: Array<String>) = ChefR().versionOption("0.1(beta)").main(args)
 
-    // # 準備階段
-    // 讀取設定參數 // todo replace hardcoded config
-    val mustHave: Map<Set<String>, Pair<Int, Int>> = mapOf(setOf(Tag.Fat.name) to (1 to 20))
-    val mustNotHave: Set<String> = setOf(Tag.Vegetables.name, Tag.Seafood.name, Tag.Meat.name, Tag.Dairy.name)
-    val boughtIngredients = listOf("Beet", "Ginger", "Pickles")
-    val canBuyIngredientCount = 3
-    val cookingTimeModifier = 0F
-    val perks: Map<String, Pair<Int, Int>> =
-        emptyMap() // mapOf("" to (10 to 0), "Fruit" to (3 to 0), "Nut" to (1 to 80))
-    val leaderboardSize = 10
-    val stopByCookingTime = true // ignore if cookingTimeModifier is 0
-    val stopByCostMultiple = 1.8F
-    // 讀取並解析食材資料
-    val data: Raw = Gson().fromJson(raw, Raw::class.java)
-    val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
-    available += boughtIngredients
+class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
+    val mustHaveOpt: List<List<String>> by option(
+        "-mh", "--mustHave",
+        help = """n ingredient names or tags followed by number(default 1) and portion(default 0). 
+                  e.g. -mh Nut[,Apple,...[,3[,20]]] means searching for recipe having 3 Nut or Apple or ... with portion >= 20, such as {Apple, Almonds, Peanuts, ...}""".trimIndent()
+    ).split(",").multiple()
 
-    // 為了用 bits 表示食譜，將食材對應至 bit
-    val requiredBits = data.indi.count()
-    val ingredBitsMap =
-        data.indi.mapIndexed { i, ingredient -> ingredient.Name to BitSet(requiredBits).apply { set(i) } }.toMap()
+    val perksOpt: List<List<String>> by option(
+        "-pk", "--perks",
+        help = """1 ingredient name or tags followed by number(default 1) and portion(default 0). 
+                  e.g. -mh Nut[,3[,20]] means searching for recipe having 3 Nut with portion >= 20, such as {Pine_Nuts, Almonds, Peanuts, ...}""".trimIndent()
+    ).split(",").multiple()
 
-    val known = HashSet<BitSet>()
-    // todo runtime change priority, migrate to newly configured priority queue, continue search
-    val priority = compareBy<Recipe> { it.toBuyIngredientCount.coerceAtLeast(canBuyIngredientCount) }
-        .thenByDescending { it.mustHaveCompleteRate }
-        .thenByDescending { it.mustNotHaveCompleteRate }
-        .thenByDescending { it.perkCompleteRate }
-        .thenBy { it.uselessIngredientCount }
-        .thenBy { it.cookingTime * cookingTimeModifier }
-        .thenByDescending { it.flavor.coerceAtMost(50) }
-        .thenBy { it.realCost }
-    var open = PriorityQueue<Recipe>(priority)
-    Recipe.candidates = data.indi
-    Recipe.available = available
-    Recipe.ingredBitsMap = ingredBitsMap
-    Recipe.match = data.match
-    Recipe.mustHave = mustHave
-    Recipe.mustNotHave = mustNotHave
-    Recipe.perks = perks
+    val avoidOpt: List<String> by option(
+        "-a", "--avoid",
+        help = "n ingredient names or tags that you want to avoid. e.g. for vegan, try `--avoid Meat,Seafood,Dairy`"
+    ).split(",").default(emptyList())
 
-    // # 初始化搜尋起始狀態
-    val beginRecipe = Recipe(emptyList(), 0, 0F)
-    open.add(beginRecipe)
-    known += beginRecipe.bits
+    val ownIngredientsOpt: List<String> by option(
+        "-i", "--ingredients",
+        help = "n ingredient names that you've purchased"
+    ).split(",").default(emptyList())
 
-    // todo save/load solutions
-    // 目標：風味滿50分的前提下，煮最快且成本最低
-    val closed = PriorityQueue<Recipe>(priority)
+    val ingredientPointsOpt: Int by option(
+        "-ip", "--ingredientPoints",
+        help = "Number of your free ingredient points. Default: 0"
+    ).int().restrictTo(min = 0, clamp = true).default(0)
 
-    // 排行榜－顯示目前前 n 個最佳解
-    val leaderboard = PriorityQueue<Recipe>(priority.reversed())
+    val cookingTimeOpt: Float by option(
+        "-t", "--cookingTimeFactor",
+        help = "Useful when you search for something like salad or pie, which is 0.0. Default: 1.0"
+    ).float().restrictTo(min = 0F, clamp = true).default(1F)
 
-    // 開始搜尋
-    val stopCondition = Function<Recipe, Boolean> {
-        when {
-            cookingTimeModifier > 0 && stopByCookingTime -> it.cookingTime > closed.peek().cookingTime
-            else -> it.realCost / closed.peek().realCost > stopByCostMultiple
-        }
-    }
-    val allMem = Runtime.getRuntime().maxMemory()
-    val initMemUsed = Runtime.getRuntime().totalMemory()
-    val initMemUsage = initMemUsed.toFloat() / allMem
-    println("start! memory usage %.2f%%".format(initMemUsage * 100))
-    while (open.any()) {
-        val curr = open.poll()!!
-        closed += curr
+    val leaderboardSizeOpt: Int by option(
+        "-b", "--leaderboardSize",
+        help = "Print when first n best recipes updates. Default: 10"
+    ).int().restrictTo(min = 1, clamp = true).default(10)
 
-        if (stopCondition.apply(curr)) {
-            println("\nstop condition meets")
-            break
-        }
+    val cookingTimeStopOpt: Boolean by option(
+        "-st", "--stopByCookingTime",
+        help = "Stop search if all recipes with shortest cooking time has found. Default: true. Ignored if cookingTimeFactor > 0"
+    ).flag(default = true)
 
-        if (closed.count() % 100 == 0) {
-            val memUsed = Runtime.getRuntime().totalMemory()
-            val memUsage = memUsed.toFloat() / allMem
-            print(
-                "\r[${closed.count()} closed, ${open.count()} open, cost multiple %.2f%%, memory usage %.2f%%]"
-                    .format( curr.realCost / closed.peek().realCost * 100, memUsage * 100)
-            )
+    val costStopOpt: Float by option(
+        "-sc", "--stopByCost",
+        help = "Stop search if most of rest recipes are n times more costly then current best recipe. Default 1.8"
+    ).float().restrictTo(min = 1.0F, clamp = true).default(1.8F)
 
-            if (memUsage > 0.8F) {
-                println("\nmemory usage over 80%, releasing 90% open set")
-                val retain = PriorityQueue(priority)
-                while (retain.count() < open.count() / 10) {
-                    retain += open.poll()
+    val memoryFullThresholdOpt: Pair<Float, Float> by option(
+        "-m", "--memoryThreshold",
+        help = """drop n([0.1, 1.0] * 100%) recipes from open set if memory is m([0.1, 1.0] * 100%) full. 
+                  In practice not very useful for finding better recipes, but...you never know :P. default 0.9/0.8""".trimMargin()
+    ).float().restrictTo(min = 0.1F, max = 1F, clamp = true).pair().default(0.9F to 0.8F)
+
+    override fun run() {
+        // read config from options
+        val config = Config(
+            mustHave = mustHaveOpt.map { column ->
+                val names = column.withIndex()
+                    .takeWhile { (index, name) -> index + 2 < column.count() || name.toIntOrNull() == null }
+                    .map { it.value }.toSet()
+                echo(names)
+                when (column.count() - names.count()) {
+                    1 -> names to (column.last().toInt().coerceAtLeast(1) to 0)
+                    2 -> names to (column[names.count()].toInt().coerceAtLeast(1) to
+                            column[names.count() + 1].toInt().coerceAtLeast(0))
+                    else -> names to (1 to 0)
                 }
-                known -= open.map { it.bits }
-                println("${open.count()} dropped")
-                open = retain
-                System.gc()
+            }.toMap(),
+
+            perks = perksOpt.map { column ->
+                when (column.count()) {
+                    1 -> column[0] to (1 to 0)
+                    2 -> column[0] to ((column[1].toIntOrNull() ?: 1) to 0)
+                    3 -> column[0] to ((column[1].toIntOrNull()?.coerceAtLeast(1) ?: 1) to
+                            (column[2].toIntOrNull()?.coerceAtLeast(0) ?: 0))
+                    else -> error("invalid perk option ${column.joinToString()}")
+                }
+            }.toMap(),
+
+            avoid = avoidOpt.toSet(),
+            boughtIngredients = ownIngredientsOpt,
+            ingredientPoints = ingredientPointsOpt,
+            cookingTimeModifier = cookingTimeOpt,
+            leaderboardSize = leaderboardSizeOpt,
+            stopByCookingTime = cookingTimeStopOpt,
+            stopByCostMultiple = costStopOpt,
+            memoryFullThreshold = memoryFullThresholdOpt.second,
+            openSetDropRate = memoryFullThresholdOpt.first
+        )
+        echo("Here is your config:")
+        echo("$config")
+        TermUi.confirm("Continue with this config?", default = true, abort = true)
+
+        // 讀取並解析食材資料
+        val data: Raw = Gson().fromJson(raw, Raw::class.java)
+        val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
+        available += config.boughtIngredients
+
+        // 為了用 bits 表示食譜，將食材對應至 bit
+        val requiredBits = data.indi.count()
+        val ingredBitsMap =
+            data.indi.mapIndexed { i, ingredient -> ingredient.Name to BitSet(requiredBits).apply { set(i) } }.toMap()
+
+        val known = HashSet<BitSet>()
+        // todo runtime change priority, migrate to newly configured priority queue, continue search
+        val priority = compareBy<Recipe> { it.toBuyIngredientCount.coerceAtLeast(config.ingredientPoints) }
+            .thenByDescending { it.mustHaveCompleteRate }
+            .thenByDescending { it.mustNotHaveCompleteRate }
+            .thenByDescending { it.perkCompleteRate }
+            .thenBy { it.uselessIngredientCount }
+            .thenBy { it.cookingTime * config.cookingTimeModifier }
+            .thenByDescending { it.flavor.coerceAtMost(50) }
+            .thenBy { it.realCost }
+        var open = PriorityQueue<Recipe>(priority)
+        Recipe.candidates = data.indi
+        Recipe.available = available
+        Recipe.ingredBitsMap = ingredBitsMap
+        Recipe.match = data.match
+        Recipe.mustHave = config.mustHave
+        Recipe.mustNotHave = config.avoid
+        Recipe.perks = config.perks
+
+        // # 初始化搜尋起始狀態
+        val beginRecipe = Recipe(emptyList(), 0, 0F)
+        open.add(beginRecipe)
+        known += beginRecipe.bits
+
+        // todo save/load solutions
+        // 目標：風味滿50分的前提下，煮最快且成本最低
+        val closed = PriorityQueue<Recipe>(priority)
+
+        // 排行榜－顯示目前前 n 個最佳解
+        val leaderboard = PriorityQueue<Recipe>(priority.reversed())
+
+        // 開始搜尋
+        val stopCondition = Function<Recipe, Boolean> {
+            when {
+                config.cookingTimeModifier > 0 && config.stopByCookingTime -> it.cookingTime > closed.peek().cookingTime
+                else -> it.realCost / closed.peek().realCost > config.stopByCostMultiple
             }
         }
+        val allMem = Runtime.getRuntime().maxMemory()
+        val initMemUsed = Runtime.getRuntime().totalMemory()
+        val initMemUsage = initMemUsed.toFloat() / allMem
+        echo("start! memory usage %.2f%%".format(initMemUsage * 100))
+        while (open.any()) {
+            val curr = open.poll()!!
+            closed += curr
 
-        // 搜尋相鄰的 Recipes 意味著：新增或移除一種食材進 Recipes
-        for ((index, _) in data.indi.withIndex()) {
-            val adjacentBits = BitSet.valueOf(curr.bits.toLongArray()).apply { flip(index) }
-            // 不重複搜尋
-            if (known.contains(adjacentBits)) {
-                continue
+            if (stopCondition.apply(curr)) {
+                echo("\nstop condition meets")
+                break
             }
-            known += adjacentBits
 
-            val recipe = curr.evolveNew(index)
-            open.add(recipe)
+            if (closed.count() % 100 == 0) {
+                val memUsed = Runtime.getRuntime().totalMemory()
+                val memUsage = memUsed.toFloat() / allMem
+                echo(
+                    "\r[${closed.count()} closed, ${open.count()} open, cost multiple %.2f%%, memory usage %.2f%%]"
+                        .format(curr.realCost / closed.peek().realCost * 100, memUsage * 100),
+                    trailingNewline = false
+                )
 
-            // 刷新排行榜
-            leaderboard += recipe
-            if (leaderboard.count() <= leaderboardSize || leaderboard.poll() != recipe) {
-                println("\n$divider [after ${known.count()} searched, best $leaderboardSize below] $divider")
-                leaderboard.asSequence().sortedWith(priority).forEachIndexed { rank, leadingRecipe ->
-                    println("#$rank: ${leadingRecipe.toShortString()}")
+                if (memUsage > config.memoryFullThreshold) {
+                    echo(
+                        "\nmemory usage over %.2f%%, releasing %.2f%% open set..."
+                            .format(config.memoryFullThreshold, config.openSetDropRate)
+                    )
+                    val retain = PriorityQueue(priority)
+                    while (retain.count() < open.count() * (1 - config.openSetDropRate)) {
+                        retain += open.poll()
+                    }
+                    known -= open.map { it.bits }
+                    echo("${open.count()} dropped")
+                    open = retain
+                    System.gc()
+                }
+            }
+
+            // 搜尋相鄰的 Recipes 意味著：新增或移除一種食材進 Recipes
+            for ((index, _) in data.indi.withIndex()) {
+                val adjacentBits = BitSet.valueOf(curr.bits.toLongArray()).apply { flip(index) }
+                // 不重複搜尋
+                if (known.contains(adjacentBits)) {
+                    continue
+                }
+                known += adjacentBits
+
+                val recipe = curr.evolveNew(index)
+                open.add(recipe)
+
+                // 刷新排行榜
+                leaderboard += recipe
+                if (leaderboard.count() <= config.leaderboardSize || leaderboard.poll() != recipe) {
+                    echo("\n$divider [after ${known.count()} searched, best ${config.leaderboardSize} below] $divider")
+                    leaderboard.asSequence().sortedWith(priority).forEachIndexed { rank, leadingRecipe ->
+                        echo("#$rank: ${leadingRecipe.toShortString()}")
+                    }
                 }
             }
         }
+        echo("end!") // probably never run to here
     }
-    println("end!") // probably never run to here
 }
 
-// todo consider mustHave and perk for cost and flavor
+data class Config(
+    val mustHave: Map<Set<String>, Pair<Int, Int>>,
+    val perks: Map<String, Pair<Int, Int>>,
+    val avoid: Set<String>,
+    val boughtIngredients: List<String>,
+    val ingredientPoints: Int,
+    val cookingTimeModifier: Float,
+    val leaderboardSize: Int,
+    val stopByCookingTime: Boolean,
+    val stopByCostMultiple: Float,
+    val memoryFullThreshold: Float,
+    val openSetDropRate: Float
+)
+
 data class Recipe(
     val ingredients: List<Ingredient> = emptyList(),
     val flavor: Int,
