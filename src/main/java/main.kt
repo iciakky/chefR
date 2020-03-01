@@ -56,11 +56,12 @@ fun main() {
     val priority = compareBy<Recipe> { it.toBuyIngredientCount.coerceAtLeast(canBuyIngredientCount) }
         .thenByDescending { it.mustHaveCompleteRate }
         .thenByDescending { it.mustNotHaveCompleteRate }
-        .thenBy { it.cookingTime * cookingTimeModifier }
         .thenByDescending { it.perkCompleteRate }
+        .thenBy { it.uselessIngredientCount }
+        .thenBy { it.cookingTime * cookingTimeModifier }
         .thenByDescending { it.flavor.coerceAtMost(50) }
         .thenBy { it.realCost }
-    val open = PriorityQueue<Recipe>(priority)
+    var open = PriorityQueue<Recipe>(priority)
     Recipe.candidates = data.indi
     Recipe.available = available
     Recipe.ingredBitsMap = ingredBitsMap
@@ -71,7 +72,7 @@ fun main() {
 
     // # 初始化搜尋起始狀態
     val beginRecipe = Recipe(emptyList(), 0, 0F)
-    open += beginRecipe
+    open.add(beginRecipe)
     known += beginRecipe.bits
 
     // todo save/load solutions
@@ -82,13 +83,30 @@ fun main() {
     val leaderboard = PriorityQueue<Recipe>(priority.reversed())
 
     // 開始搜尋
-    println("start!")
+    val allMem = Runtime.getRuntime().maxMemory()
+    val initMemUsed = Runtime.getRuntime().totalMemory()
+    val initMemUsage = initMemUsed.toFloat() / allMem
+    println("start! memory usage %.2f%%".format(initMemUsage * 100))
     while (open.any()) {
         val curr = open.poll()!!
         closed += curr
 
         if (closed.count() % 100 == 0) {
-            print("\r[${closed.count()} closed, ${open.count()} open]".format())
+            val memUsed = Runtime.getRuntime().totalMemory()
+            val memUsage = memUsed.toFloat() / allMem
+            print("\r[${closed.count()} closed, ${open.count()} open, memory usage %.2f%%]".format(memUsage * 100))
+
+            if (memUsage > 0.8F) {
+                println("\nmemory usage over 80%, releasing 90% open set")
+                val retain = PriorityQueue(priority)
+                while (retain.count() < open.count() / 10) {
+                    retain += open.poll()
+                }
+                known -= open.map { it.bits }
+                println("${open.count()} dropped")
+                open = retain
+                System.gc()
+            }
         }
 
         // 搜尋相鄰的 Recipes 意味著：新增或移除一種食材進 Recipes
@@ -101,12 +119,12 @@ fun main() {
             known += adjacentBits
 
             val recipe = curr.evolveNew(index)
-            open += recipe
+            open.add(recipe)
 
             // 刷新排行榜
             leaderboard += recipe
             if (leaderboard.count() <= leaderboardSize || leaderboard.poll() != recipe) {
-                println("\n$divider [best $leaderboardSize below] $divider")
+                println("\n$divider [after ${known.count()} searched, best $leaderboardSize below] $divider")
                 leaderboard.asSequence().sortedWith(priority).forEachIndexed { rank, leadingRecipe ->
                     println("#$rank: ${leadingRecipe.toShortString()}")
                 }
@@ -130,6 +148,13 @@ data class Recipe(
         lateinit var mustHave: Map<Set<String>, Pair<Int, Int>>
         lateinit var mustNotHave: Set<String>
         lateinit var perks: Map<String, Pair<Int, Int>>
+    }
+
+    val uselessIngredientCount by lazy {
+        ingredients.count {
+            it.AromaNeutral && !(perks.contains(it.Name) || it.Tags.any { tag -> perks.contains(tag) }) &&
+                    !mustHave.keys.any { key -> key.contains(it.Name) || it.Tags.any { tag -> key.contains(tag) } }
+        }
     }
 
     val toBuyIngredientCount by lazy { ingredients.count { !available.contains(it.Name) } }
