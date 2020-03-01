@@ -1,6 +1,7 @@
 import com.google.gson.Gson
 import java.net.URL
 import java.util.*
+import java.util.function.Function
 import kotlin.math.abs
 
 val divider = "-".repeat(40)
@@ -41,6 +42,8 @@ fun main() {
     val perks: Map<String, Pair<Int, Int>> =
         emptyMap() // mapOf("" to (10 to 0), "Fruit" to (3 to 0), "Nut" to (1 to 80))
     val leaderboardSize = 10
+    val stopByCookingTime = true // ignore if cookingTimeModifier is 0
+    val stopByCostMultiple = 1.8F
     // 讀取並解析食材資料
     val data: Raw = Gson().fromJson(raw, Raw::class.java)
     val available: HashSet<String> = Gson().fromJson(rawAvailable, mutableListOf<String>().javaClass).toHashSet()
@@ -83,6 +86,12 @@ fun main() {
     val leaderboard = PriorityQueue<Recipe>(priority.reversed())
 
     // 開始搜尋
+    val stopCondition = Function<Recipe, Boolean> {
+        when {
+            cookingTimeModifier > 0 && stopByCookingTime -> it.cookingTime > closed.peek().cookingTime
+            else -> it.realCost / closed.peek().realCost > stopByCostMultiple
+        }
+    }
     val allMem = Runtime.getRuntime().maxMemory()
     val initMemUsed = Runtime.getRuntime().totalMemory()
     val initMemUsage = initMemUsed.toFloat() / allMem
@@ -91,10 +100,18 @@ fun main() {
         val curr = open.poll()!!
         closed += curr
 
+        if (stopCondition.apply(curr)) {
+            println("\nstop condition meets")
+            break
+        }
+
         if (closed.count() % 100 == 0) {
             val memUsed = Runtime.getRuntime().totalMemory()
             val memUsage = memUsed.toFloat() / allMem
-            print("\r[${closed.count()} closed, ${open.count()} open, memory usage %.2f%%]".format(memUsage * 100))
+            print(
+                "\r[${closed.count()} closed, ${open.count()} open, cost multiple %.2f%%, memory usage %.2f%%]"
+                    .format( curr.realCost / closed.peek().realCost * 100, memUsage * 100)
+            )
 
             if (memUsage > 0.8F) {
                 println("\nmemory usage over 80%, releasing 90% open set")
