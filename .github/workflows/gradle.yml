@@ -17,3 +17,10 @@ jobs:
       run: chmod +x gradlew
     - name: Build distribution with Gradle
       run: ./gradlew installDist
+    - name: Upload artifact
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        # Artifact name
+        name: executable
+        # Directory containing files to upload
+        path: build/install
