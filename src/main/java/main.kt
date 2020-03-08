@@ -9,6 +9,7 @@ import java.net.URL
 import java.util.*
 import java.util.function.Function
 import kotlin.math.abs
+import kotlin.math.max
 
 val divider = "-".repeat(40)
 
@@ -35,6 +36,14 @@ enum class Tag {
     Wine
 }
 
+val tagPercentage = mapOf(
+    "Spice" to 5,
+    "Fruit" to 15,
+    "Nut" to 15,
+    "Dairy" to 15,
+    "Alcohol" to 15
+)
+
 fun main(args: Array<String>) = ChefR().versionOption("0.1(beta)").main(args)
 
 class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
@@ -49,6 +58,11 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
         help = """1 ingredient name or tags followed by number(default 1) and portion(default 0). 
                   e.g. -mh Nut[,3[,20]] means searching for recipe having 3 Nut with portion >= 20, such as {Pine_Nuts, Almonds, Peanuts, ...}""".trimIndent()
     ).split(",").multiple()
+
+    val tagsOpt: List<String> by option(
+        "-t", "--tags",
+        help = "algorithm will try add ingredients or increase portion to make recipe having these tags"
+    ).split(",").default(emptyList())
 
     val avoidOpt: List<String> by option(
         "-a", "--avoid",
@@ -66,9 +80,14 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
     ).int().restrictTo(min = 0, clamp = true).default(0)
 
     val cookingTimeOpt: Float by option(
-        "-t", "--cookingTimeFactor",
+        "-tf", "--cookingTimeFactor",
         help = "Useful when you search for something like salad or pie, which is 0.0. Default: 1.0"
     ).float().restrictTo(min = 0F, clamp = true).default(1F)
+
+    val maxScoreOpt: Int by option(
+        "-ms", "--maxScore",
+        help = "by default 80(50 flavor + 30 perk), but you can lower it for cheaper recipes"
+    ).int().restrictTo(0..80, clamp = true).default(80)
 
     val leaderboardSizeOpt: Int by option(
         "-b", "--leaderboardSize",
@@ -94,7 +113,7 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
     override fun run() {
         // read config from options
         val config = Config(
-            mustHave = mustHaveOpt.map { column ->
+            mustHave = mustHaveOpt.associate { column ->
                 val names = column.withIndex()
                     .takeWhile { (index, name) -> index + 2 < column.count() || name.toIntOrNull() == null }
                     .map { it.value }.toSet()
@@ -105,9 +124,9 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
                             column[names.count() + 1].toInt().coerceAtLeast(0))
                     else -> names to (1 to 0)
                 }
-            }.toMap(),
+            },
 
-            perks = perksOpt.map { column ->
+            perks = perksOpt.associate { column ->
                 when (column.count()) {
                     1 -> column[0] to (1 to 0)
                     2 -> column[0] to ((column[1].toIntOrNull() ?: 1) to 0)
@@ -115,12 +134,14 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
                             (column[2].toIntOrNull()?.coerceAtLeast(0) ?: 0))
                     else -> error("invalid perk option ${column.joinToString()}")
                 }
-            }.toMap(),
+            },
 
+            requiredTags = tagsOpt.toSet(),
             avoid = avoidOpt.toSet(),
             boughtIngredients = ownIngredientsOpt,
             ingredientPoints = ingredientPointsOpt,
             cookingTimeModifier = cookingTimeOpt,
+            maxScore = maxScoreOpt,
             leaderboardSize = leaderboardSizeOpt,
             stopByCookingTime = cookingTimeStopOpt,
             stopByCostMultiple = costStopOpt,
@@ -145,20 +166,18 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
         // todo runtime change priority, migrate to newly configured priority queue, continue search
         val priority = compareBy<Recipe> { it.toBuyIngredientCount.coerceAtLeast(config.ingredientPoints) }
             .thenByDescending { it.mustHaveCompleteRate }
+            .thenByDescending { it.requiredTagsCount }
             .thenByDescending { it.mustNotHaveCompleteRate }
-            .thenByDescending { it.perkCompleteRate }
             .thenBy { it.uselessIngredientCount }
             .thenBy { it.cookingTime * config.cookingTimeModifier }
-            .thenByDescending { it.flavor.coerceAtMost(50) }
+            .thenByDescending { it.score.coerceAtMost(config.maxScore) }
             .thenBy { it.realCost }
         var open = PriorityQueue<Recipe>(priority)
         Recipe.candidates = data.indi
         Recipe.available = available
         Recipe.ingredBitsMap = ingredBitsMap
         Recipe.match = data.match
-        Recipe.mustHave = config.mustHave
-        Recipe.mustNotHave = config.avoid
-        Recipe.perks = config.perks
+        Recipe.config = config
 
         // # 初始化搜尋起始狀態
         val beginRecipe = Recipe(emptyList(), 0, 0F)
@@ -246,10 +265,12 @@ class ChefR : CliktCommand(printHelpOnEmptyArgs = true) {
 data class Config(
     val mustHave: Map<Set<String>, Pair<Int, Int>>,
     val perks: Map<String, Pair<Int, Int>>,
+    val requiredTags: Set<String>,
     val avoid: Set<String>,
     val boughtIngredients: List<String>,
     val ingredientPoints: Int,
     val cookingTimeModifier: Float,
+    val maxScore: Int,
     val leaderboardSize: Int,
     val stopByCookingTime: Boolean,
     val stopByCostMultiple: Float,
@@ -267,15 +288,15 @@ data class Recipe(
         lateinit var available: Set<String>
         lateinit var ingredBitsMap: Map<String, BitSet>
         lateinit var match: Map<String, Match>
-        lateinit var mustHave: Map<Set<String>, Pair<Int, Int>>
-        lateinit var mustNotHave: Set<String>
-        lateinit var perks: Map<String, Pair<Int, Int>>
+        lateinit var config: Config
     }
+
+    val score by lazy { flavor.coerceIn(0..50) + 10 * perkCompleteRate }
 
     val uselessIngredientCount by lazy {
         ingredients.count {
-            it.AromaNeutral && !(perks.contains(it.Name) || it.Tags.any { tag -> perks.contains(tag) }) &&
-                    !mustHave.keys.any { key -> key.contains(it.Name) || it.Tags.any { tag -> key.contains(tag) } }
+            it.AromaNeutral && !(config.perks.contains(it.Name) || it.Tags.any { tag -> config.perks.contains(tag) }) &&
+                    !config.mustHave.keys.any { key -> key.contains(it.Name) || it.Tags.any { tag -> key.contains(tag) } }
         }
     }
 
@@ -286,8 +307,8 @@ data class Recipe(
 
     // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
     val mustHaveCompleteRate: Int by lazy {
-        if (mustHave.isEmpty()) 0
-        else mustHave.map { (condition, numberAndPortion) ->
+        if (config.mustHave.isEmpty()) 0
+        else config.mustHave.map { (condition, numberAndPortion) ->
             val (number, portion) = numberAndPortion
             ingredients.filter {
                 it.MaxPortion >= portion && (condition.contains(it.Name) || it.Tags.any { tag -> condition.contains(tag) })
@@ -295,17 +316,18 @@ data class Recipe(
         }.sum()
     }
     val mustNotHaveCompleteRate: Int by lazy {
-        if (mustNotHave.isEmpty()) 0
-        else mustNotHave.count { condition ->
+        if (config.avoid.isEmpty()) 0
+        else config.avoid.count { condition ->
             ingredients.any {
                 condition.contains(it.Name) || it.Tags.any { tag -> condition.contains(tag) }
             }
         } * -1
     }
+
     // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
     val perkCompleteRate: Int by lazy {
-        if (perks.isEmpty()) 0
-        else perks.count { (condition, numberAndPortion) ->
+        if (config.perks.isEmpty()) 0
+        else config.perks.count { (condition, numberAndPortion) ->
             val (number, portion) = numberAndPortion
             // 總食材個數
             if (condition.isBlank()) {
@@ -324,21 +346,77 @@ data class Recipe(
             }
         }
     }
+
+    // todo 實際上不一定能夠達到此 tag (e.g. max portion 太低而無法滿足必要比例)
+    val requiredTagsCount: Int by lazy { config.requiredTags.count { req -> ingredients.any { i -> i.Tags.any { it == req } } } }
+
+    // todo extract logic, these knowledge is not Recipe should know
+    // all config considered: mustHave, perks, requiredTags
+    val extraPortion: Map<String, Int> by lazy {
+        val newPortion = mutableMapOf<String, Int>()
+        // 對每個分量要求，找到 Unit Cost 最低的選項
+        config.mustHave.entries.filter { (_, numberAndPortion) -> (numberAndPortion.second > 0) }
+            .forEach { (conditions, numberAndPortion) ->
+                val (number, portion) = numberAndPortion
+                ingredients.asSequence()
+                    .filter { conditions.contains(it.Name) || it.Tags.any { tag -> conditions.contains(tag) } }
+                    .filter { it.MaxPortion >= portion }
+                    .sortedBy { it.UnitCost }.take(number)
+                    .forEach { newPortion[it.Name] = max((newPortion[it.Name] ?: 0), portion) }
+            }
+        config.perks.entries.filter { it.key.isNotBlank() && it.value.second > 0 }
+            .forEach { (condition, numberAndPortion) ->
+                val (number, portion) = numberAndPortion
+                ingredients.asSequence()
+                    .filter { it.Name == condition || it.Tags.contains(condition) }
+                    .filter { it.MaxPortion >= portion }
+                    .sortedBy { it.UnitCost }.take(number)
+                    .forEach { newPortion[it.Name] = max((newPortion[it.Name] ?: 0), portion) }
+            }
+        if (config.requiredTags.any()) {
+            // 調成指定的比例以滿足 requiredTags
+            // calc 1% = ?g by portion_of_other / remain_%
+            val requiredPercentage = config.requiredTags.sumBy { tagPercentage[it] ?: 25 }.coerceIn(0..99) // 0~99
+            val others = ingredients.filter { it.Tags.all { tag -> !config.requiredTags.contains(tag) } }
+            if (others.count() < ingredients.count()) {
+                val gPerPercent =
+                    others.sumBy { newPortion[it.Name] ?: it.MinPortion }.toFloat() / (100 - requiredPercentage)
+                val requiredPortion = config.requiredTags
+                    .associateWith { (gPerPercent * (tagPercentage[it] ?: 25)).toInt() + 1 }.toMutableMap()
+                ingredients.forEach { i ->
+                    i.Tags.filter { requiredPortion.contains(it) }.forEach { tag ->
+                        requiredPortion[tag] =
+                            (requiredPortion[tag]!! - (newPortion[i.Name] ?: i.MinPortion)).coerceAtLeast(0)
+                    }
+                }
+                ingredients.asSequence()
+                    .filter { it.Tags.any { tag -> requiredPortion.contains(tag) } }
+                    .sortedBy { it.UnitCost }
+                    .forEach { i ->
+                        val tag = i.Tags.filter { requiredPortion.contains(it) }.maxBy { requiredPortion[it]!! }!!
+                        val required =
+                            requiredPortion[tag]!! // todo fix: 這裡會多算，其他也有此 tag 的 portion 也應該要消耗 required portion
+                        val curr = newPortion[i.Name] ?: i.MinPortion
+                        val room = i.MaxPortion - curr
+                        val extra = required.coerceAtMost(room)
+                        if (extra > 0) {
+                            newPortion[i.Name] = curr + extra
+                            i.Tags.filter { requiredPortion.contains(it) }.forEach {
+                                requiredPortion[it] = (requiredPortion[it]!! - extra).coerceAtLeast(0)
+                            }
+                        }
+                    }
+            }
+        }
+        newPortion
+    }
+
     // todo extract logic to be with mustHave/perks, these knowledge is not Recipe should know
     val realCost: Float by lazy {
-        // 這裡假設在要求分量時上 mustHave 跟 perks 不會重複
-        // 對每個分量要求，找到 Unit Cost 最低的選項，將原本的 cost 加上額外增加的成本 (unit*portion - minCost)
-        mustHave.entries.fold(0F) { ret, (conditions, numberAndPortion) ->
-            val (number, portion) = numberAndPortion
-            if (portion < 0) ret
-            else ret + (ingredients.asSequence().filter {
-                conditions.contains(it.Name) || it.Tags.any { tag -> conditions.contains(tag) }
-            }.sortedBy { it.UnitCost }.take(number).map { it.UnitCost * portion - it.MinCost }.sum())
-        } + perks.filter { it.key.isNotBlank() && it.value.second > 0 }.entries.fold(0F) { ret, (condition, numberAndPortion) ->
-            val (number, portion) = numberAndPortion
-            ret + (ingredients.asSequence().filter { it.Name == condition || it.Tags.contains(condition) }
-                .sortedBy { it.UnitCost }.take(number).map { it.UnitCost * portion - it.MinCost }.sum())
-        } + cost
+        // 將原本的 cost 加上額外增加的成本 (unit*portion - minCost)
+        this.cost + ingredients.filter { extraPortion.contains(it.Name) }
+            .sumByDouble { (it.UnitCost * (extraPortion[it.Name] ?: it.MinPortion) - it.MinCost).toDouble() }
+            .toFloat()
     }
     val bits: BitSet by lazy {
         ingredients.fold(BitSet()) { ret, ing ->
@@ -381,7 +459,11 @@ data class Recipe(
     }
 
     fun toShortString(): String {
-        return "${toBuyIngredientCount}/${mustHaveCompleteRate}/${perkCompleteRate}/${cookingTime}/${realCost}/${flavor}/${ingredients.joinToString { it.Name }}"
+        return "${toBuyIngredientCount}/${mustHaveCompleteRate}/${requiredTagsCount}/${cookingTime}/${realCost}/${score}/${ingredients.joinToString { i ->
+            val isNew = !available.contains(i.Name)
+            val extra = extraPortion.contains(i.Name)
+            (if (isNew) "*" else "") + i.Name + (if (extra) "-${extraPortion[i.Name]!!}" else "")
+        }}"
     }
 }
 
